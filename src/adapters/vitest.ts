@@ -25,9 +25,25 @@ interface VitestTask {
   tasks?: VitestTask[];
 }
 
+interface VitestAssertionResult {
+  ancestorTitles: string[];
+  title: string;
+  fullName: string;
+  status: 'passed' | 'failed' | 'pending' | 'todo' | 'skipped';
+  duration: number | null;
+  failureMessages: string[];
+}
+
 interface VitestFileResult {
-  filepath: string;
-  tasks: VitestTask[];
+  /** Vitest <2.x uses filepath */
+  filepath?: string;
+  /** Vitest >=2.x uses name (absolute path, same as Jest) */
+  name?: string;
+  /** Vitest <2.x uses nested tasks */
+  tasks?: VitestTask[];
+  /** Vitest >=2.x uses Jest-style assertionResults */
+  assertionResults?: VitestAssertionResult[];
+  status?: string;
 }
 
 interface VitestJsonOutput {
@@ -139,13 +155,38 @@ export class VitestAdapter extends BaseAdapter {
 
     const tests: TestResult[] = [];
     for (const fileResult of vitestOutput.testResults) {
-      const relPath = relative(options.projectDir, fileResult.filepath);
-      const fileTests = flattenTests(fileResult.tasks);
-      for (const test of fileTests) {
-        if (test.status === 'failed' && !test.sourceContext) {
-          test.sourceContext = { testFile: relPath, testLine: 0 };
+      const filePath = fileResult.name ?? fileResult.filepath;
+      const relPath = filePath ? relative(options.projectDir, filePath) : 'unknown';
+
+      if (fileResult.assertionResults) {
+        // Vitest >=2.x: Jest-style assertionResults
+        for (const ar of fileResult.assertionResults) {
+          const errorMsg = ar.failureMessages.length
+            ? ar.failureMessages[0].replace(/\u001b\[[0-9;]*m/g, '').trim()
+            : undefined;
+          const fullError = ar.failureMessages.length
+            ? ar.failureMessages.join('\n\n').replace(/\u001b\[[0-9;]*m/g, '').trim()
+            : undefined;
+          const parts = [...ar.ancestorTitles, ar.title];
+          tests.push({
+            name: ar.title,
+            fullName: parts.join(' > '),
+            status: mapStatus(ar.status === 'passed' ? 'pass' : ar.status === 'failed' ? 'fail' : ar.status),
+            duration: ar.duration ?? 0,
+            failureMessage: errorMsg ? (errorMsg.length > 500 ? errorMsg.slice(0, 500) + '...' : errorMsg) : undefined,
+            fullError,
+            sourceContext: ar.status === 'failed' ? { testFile: relPath, testLine: 0 } : undefined,
+          });
         }
-        tests.push(test);
+      } else if (fileResult.tasks) {
+        // Vitest <2.x: nested tasks format
+        const fileTests = flattenTests(fileResult.tasks);
+        for (const test of fileTests) {
+          if (test.status === 'failed' && !test.sourceContext) {
+            test.sourceContext = { testFile: relPath, testLine: 0 };
+          }
+          tests.push(test);
+        }
       }
     }
 
