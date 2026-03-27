@@ -13,25 +13,47 @@ Test frameworks were designed for humans. LLMs get ANSI escape codes, watch mode
 - **Source enrichment** — Failure reports include the relevant source code around each assertion
 - **Watch mode protection** — Impossible to accidentally enter interactive mode
 
-## Quick Start
+## Installation
 
 ```bash
-# Install
 git clone https://github.com/r-marques/testmcp.git
 cd testmcp
 yarn install
 yarn build
+```
 
-# Configure as MCP server in Claude Code
-# Add to your settings.json:
+### Configure as MCP server
+
+**Claude Code (recommended):**
+
+```bash
+claude mcp add testmcp -- node /absolute/path/to/testmcp/dist/index.js
+```
+
+This registers testmcp as a local stdio MCP server. Restart Claude Code after adding.
+
+**Other MCP clients (Cursor, Windsurf, etc.):**
+
+Add to your MCP configuration file:
+
+```json
 {
   "mcpServers": {
     "testmcp": {
       "command": "node",
-      "args": ["/path/to/testmcp/dist/index.js"]
+      "args": ["/absolute/path/to/testmcp/dist/index.js"]
     }
   }
 }
+```
+
+### Verify it works
+
+After restarting your MCP client, the testmcp tools should be available. In Claude Code you can verify with:
+
+```bash
+claude mcp list
+# Should show: testmcp: node /path/to/testmcp/dist/index.js - ✓ Connected
 ```
 
 ## Tools
@@ -51,28 +73,33 @@ yarn build
 
 ### The Progressive Disclosure Flow
 
-Instead of dumping 5000 lines of test output, testmcp gives you information in layers:
+Instead of dumping thousands of lines of test output, testmcp gives you information in layers:
 
 **Step 1: Run tests** — Get a compact summary
+
 ```
 run_tests({ projectDir: "/app" })
 → { total: 200, passed: 197, failed: 3, failedTests: ["auth > login > rejects expired token", ...] }
 ```
 
 **Step 2: Drill into failures** — Get failure details with source context
+
 ```
 get_failures({ runId: "abc-123" })
 → For each failure:
    - Concise error message
-   - 7 lines of source code around the assertion (with >>> marker)
+   - 7 lines of source code around the assertion
    - Test file and line number
 ```
 
-**Step 3: Deep dive** — Full stack trace for a single test
+**Step 3: Deep dive** — Full stack trace for a single test (only when needed)
+
 ```
 get_test_detail({ runId: "abc-123", testName: "auth > login > rejects expired token" })
 → Complete error output with full stack trace
 ```
+
+This approach uses **4-5x fewer tokens** compared to raw test output in typical failure scenarios, because you never pay for the 197 passing tests you don't care about.
 
 ### Diff-Aware Test Selection
 
@@ -97,10 +124,20 @@ If the suite takes longer than 30 seconds, the process is killed and partial res
 | Framework | Detection | Output Parsing |
 |-----------|-----------|----------------|
 | **Jest** | `jest.config.*`, package.json | `--json` (native JSON reporter) |
-| **Vitest** | `vitest.config.*`, package.json | `--reporter=json` |
-| **Pytest** | `pyproject.toml`, `pytest.ini`, `conftest.py` | `--json-report` plugin, or verbose stdout fallback |
+| **Vitest** | `vitest.config.*`, package.json | `--reporter=json` (supports both v1.x tasks format and v2+ Jest-style format) |
+| **Pytest** | `pyproject.toml`, `pytest.ini`, `conftest.py` | Layered fallback: `pytest-reportlog` JSONL → `--junitxml` (built-in) → verbose stdout parsing |
 
 testmcp auto-detects the framework and package manager (npm, yarn, pnpm, poetry). No configuration needed.
+
+### Pytest Fallback Chain
+
+Pytest has no built-in JSON reporter, so testmcp uses a three-layer fallback strategy:
+
+1. **`pytest-reportlog`** (primary) — JSONL format via `--report-log`. Streaming-friendly, survives timeouts. Requires `pip install pytest-reportlog`.
+2. **`--junitxml`** (fallback) — Built into pytest, zero dependencies. Standard JUnit XML format.
+3. **Verbose stdout** (last resort) — Parses `-v --tb=short` output with regex. Works everywhere.
+
+The server automatically falls through the chain if a plugin isn't installed — no configuration needed.
 
 ## Architecture
 
@@ -113,8 +150,8 @@ src/
 ├── adapters/
 │   ├── base.ts           # Abstract adapter interface
 │   ├── jest.ts           # Jest adapter
-│   ├── vitest.ts         # Vitest adapter
-│   └── pytest.ts         # Pytest adapter (with fallback parser)
+│   ├── vitest.ts         # Vitest adapter (v1.x + v2+ formats)
+│   └── pytest.ts         # Pytest adapter (reportlog → junitxml → verbose)
 ├── git/
 │   └── diff-analyzer.ts  # Git diff → affected test files
 ├── enrichment/
@@ -124,15 +161,20 @@ src/
     └── detect.ts         # Framework auto-detection
 ```
 
+### Key Design Decisions
+
+- **Stdio transport only** — No HTTP server, no ports. Works as a local subprocess for Claude Code and IDE integrations.
+- **Subprocess isolation** — Frameworks are spawned as child processes with `CI=true`, `TERM=dumb`. Zero coupling to framework versions.
+- **In-memory store** — Test runs stored by UUID with LRU eviction at 50 runs. Enables progressive drill-down without re-running tests.
+- **Minimal dependencies** — Only `@modelcontextprotocol/sdk` and `zod`. Everything else uses Node.js built-ins.
+
 ## Development
 
 ```bash
-yarn build    # Compile TypeScript
-yarn dev      # Run in dev mode (tsx)
-yarn start    # Run compiled server
-
-# E2E test
-npx tsx test/e2e.ts test/fixtures/jest-project
+yarn build        # Compile TypeScript
+yarn dev          # Run in dev mode (tsx)
+yarn test         # Run test suite (Vitest)
+yarn test:watch   # Run tests in watch mode
 ```
 
 ## License
