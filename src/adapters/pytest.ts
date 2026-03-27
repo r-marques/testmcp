@@ -422,20 +422,23 @@ export class PytestAdapter extends BaseAdapter {
   } | null {
     // The final summary line is typically the last non-empty line or preceded by "="
     // Pattern: "={N} <counts> in <duration> ={N}" or just "<counts> in <duration>"
-    const summaryPattern = /(\d+\s+failed)?[,\s]*(\d+\s+passed)?[,\s]*(\d+\s+skipped)?[,\s]*(?:.*?)in\s+([\d.]+)s/;
-
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i];
       // Look for lines containing " passed" or " failed" followed by "in <N>s"
       if (!/\b(?:passed|failed)\b/.test(line) || !/\bin\s+[\d.]+s\b/.test(line)) continue;
 
-      const match = line.match(summaryPattern);
-      if (!match) continue;
+      // Extract individual counts: "N passed", "N failed", "N skipped"
+      const passedMatch = line.match(/(\d+)\s+passed/);
+      const failedMatch = line.match(/(\d+)\s+failed/);
+      const skippedMatch = line.match(/(\d+)\s+skipped/);
+      const durationMatch = line.match(/in\s+([\d.]+)s/);
 
-      const failed = match[1] ? parseInt(match[1], 10) : 0;
-      const passed = match[2] ? parseInt(match[2], 10) : 0;
-      const skipped = match[3] ? parseInt(match[3], 10) : 0;
-      const duration = Math.round(parseFloat(match[4]) * 1000);
+      if (!durationMatch) continue;
+
+      const passed = passedMatch ? parseInt(passedMatch[1], 10) : 0;
+      const failed = failedMatch ? parseInt(failedMatch[1], 10) : 0;
+      const skipped = skippedMatch ? parseInt(skippedMatch[1], 10) : 0;
+      const duration = Math.round(parseFloat(durationMatch[1]) * 1000);
 
       return { passed, failed, skipped, duration };
     }
