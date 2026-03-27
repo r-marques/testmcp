@@ -2,3 +2,4 @@ node_modules/
 dist/
 *.tsbuildinfo
 .claude/settings.json
+DISCOVERY.md
