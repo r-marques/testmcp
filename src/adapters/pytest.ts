@@ -10,26 +10,25 @@ import type {
   CoverageSummary, CoverageMetric,
 } from '../types.js';
 
-interface PytestJsonTest {
-  nodeid: string;
-  outcome: 'passed' | 'failed' | 'skipped' | 'error' | 'xfailed' | 'xpassed';
-  duration: number;
-  call?: { longrepr?: string };
-  setup?: { longrepr?: string };
-  teardown?: { longrepr?: string };
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type PytestParseMode = 'reportlog' | 'junitxml' | 'verbose';
+
+/** A single line from pytest-reportlog JSONL output */
+interface ReportLogEntry {
+  $report_type?: string;
+  nodeid?: string;
+  outcome?: string;
+  duration?: number;
+  when?: string;
+  longrepr?: string | null;
 }
 
-interface PytestJsonReport {
-  summary: {
-    passed?: number;
-    failed?: number;
-    error?: number;
-    skipped?: number;
-    total: number;
-    duration: number;
-  };
-  tests: PytestJsonTest[];
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function mapPytestStatus(outcome: string): TestStatus {
   switch (outcome) {
@@ -52,6 +51,14 @@ function nodeIdToName(nodeid: string): string {
   return parts[parts.length - 1];
 }
 
+function truncate(s: string, max = 500): string {
+  return s.length > max ? s.slice(0, max) + '...' : s;
+}
+
+// ---------------------------------------------------------------------------
+// Adapter
+// ---------------------------------------------------------------------------
+
 export class PytestAdapter extends BaseAdapter {
   readonly framework = 'pytest' as const;
 
@@ -60,45 +67,51 @@ export class PytestAdapter extends BaseAdapter {
     return all.find(d => d.framework === 'pytest') ?? null;
   }
 
-  buildCommand(options: RunOptions & { fallbackMode?: boolean }): { command: string; args: string[]; env?: Record<string, string> } {
-    const outputFile = join(tmpdir(), `testmcp-pytest-${randomUUID()}.json`);
+  buildCommand(
+    options: RunOptions & { parseMode?: PytestParseMode },
+  ): { command: string; args: string[]; env?: Record<string, string> } {
+    const mode: PytestParseMode = options.parseMode ?? 'reportlog';
+    const outputFile = mode !== 'verbose'
+      ? join(tmpdir(), `testmcp-pytest-${randomUUID()}.${mode === 'reportlog' ? 'jsonl' : 'xml'}`)
+      : '';
     const usePoetry = options.packageManager === 'poetry';
-    const fallback = options.fallbackMode ?? false;
 
     const command = usePoetry ? 'poetry' : 'python';
     const prefix = usePoetry ? ['run', 'python', '-m', 'pytest'] : ['-m', 'pytest'];
-
     const args = [...prefix];
 
-    if (fallback) {
-      // Fallback: verbose output for line-by-line parsing
-      args.push('--tb=short', '-v', '--no-header', '-p', 'no:cacheprovider');
-    } else {
-      // Preferred: JSON report plugin
-      args.push(
-        '--tb=short', '-q', '--no-header',
-        '--json-report', `--json-report-file=${outputFile}`,
-        '-p', 'no:cacheprovider',
-      );
+    switch (mode) {
+      case 'reportlog':
+        args.push(
+          '--tb=short', '-q', '--no-header',
+          `--report-log=${outputFile}`,
+          '-p', 'no:cacheprovider',
+        );
+        break;
+      case 'junitxml':
+        args.push(
+          '--tb=short', '-v', '--no-header',
+          `--junitxml=${outputFile}`,
+          '-p', 'no:cacheprovider',
+        );
+        break;
+      case 'verbose':
+        args.push('--tb=short', '-v', '--no-header', '-p', 'no:cacheprovider');
+        break;
     }
 
-    if (options.fileGlob) {
-      args.push(options.fileGlob);
-    }
-    if (options.testNamePattern) {
-      args.push('-k', options.testNamePattern);
-    }
-    if (options.testFiles?.length) {
-      args.push(...options.testFiles);
-    }
-    if (options.coverage) {
-      args.push('--cov', '--cov-report=json');
-    }
+    if (options.fileGlob) args.push(options.fileGlob);
+    if (options.testNamePattern) args.push('-k', options.testNamePattern);
+    if (options.testFiles?.length) args.push(...options.testFiles);
+    if (options.coverage) args.push('--cov', '--cov-report=json');
 
     return {
       command,
       args,
-      env: { __TEST_SOLVER_OUTPUT_FILE: fallback ? '' : outputFile },
+      env: {
+        __TESTMCP_PARSE_MODE: mode,
+        __TESTMCP_OUTPUT_FILE: outputFile,
+      },
     };
   }
 
@@ -110,77 +123,26 @@ export class PytestAdapter extends BaseAdapter {
   ): Promise<TestRunResult> {
     const runId = randomUUID();
     const env = options.env as Record<string, string> | undefined;
-    const outputFile = env?.__TEST_SOLVER_OUTPUT_FILE;
+    const mode = (env?.__TESTMCP_PARSE_MODE ?? 'verbose') as PytestParseMode;
+    const outputFile = env?.__TESTMCP_OUTPUT_FILE;
 
-    let report: PytestJsonReport | null = null;
-
-    // Try JSON report file first
-    if (outputFile) {
+    // Try structured output first (reportlog JSONL or JUnit XML)
+    if (outputFile && mode !== 'verbose') {
       try {
         const content = await readFile(outputFile, 'utf-8');
-        report = JSON.parse(content);
+        if (mode === 'reportlog') {
+          return this.parseReportLog(runId, content, stdout, stderr, options);
+        }
+        if (mode === 'junitxml') {
+          return this.parseJunitXml(runId, content, stdout, stderr, options);
+        }
       } catch {
-        // Fall through to stdout parsing
+        // File not readable — fall through to verbose stdout parsing
       }
     }
 
-    // Fallback: parse verbose stdout
-    if (!report) {
-      return this.parseFallbackOutput(runId, stdout, stderr, exitCode, options);
-    }
-
-    const tests: TestResult[] = report.tests.map(t => {
-      const errorParts: string[] = [];
-      if (t.call?.longrepr) errorParts.push(t.call.longrepr);
-      if (t.setup?.longrepr) errorParts.push(t.setup.longrepr);
-      if (t.teardown?.longrepr) errorParts.push(t.teardown.longrepr);
-      const fullError = errorParts.join('\n\n').trim() || undefined;
-      const failureMessage = fullError
-        ? (fullError.length > 500 ? fullError.slice(0, 500) + '...' : fullError)
-        : undefined;
-
-      const testFile = t.nodeid.split('::')[0];
-
-      return {
-        name: nodeIdToName(t.nodeid),
-        fullName: nodeIdToFullName(t.nodeid),
-        status: mapPytestStatus(t.outcome),
-        duration: Math.round(t.duration * 1000),
-        failureMessage,
-        fullError,
-        sourceContext: t.outcome === 'failed' || t.outcome === 'error'
-          ? { testFile, testLine: 0 }
-          : undefined,
-      };
-    });
-
-    const failedTests = tests.filter(t => t.status === 'failed').map(t => t.fullName);
-
-    let coverage: CoverageSummary | undefined;
-    if (options.coverage) {
-      coverage = await this.parseCoverage(options.projectDir);
-    }
-
-    return {
-      summary: {
-        runId,
-        framework: 'pytest',
-        projectDir: options.projectDir,
-        total: report.summary.total,
-        passed: report.summary.passed ?? 0,
-        failed: (report.summary.failed ?? 0) + (report.summary.error ?? 0),
-        skipped: report.summary.skipped ?? 0,
-        duration: Math.round(report.summary.duration * 1000),
-        failedTests,
-        timedOut: false,
-        partial: false,
-        timestamp: new Date().toISOString(),
-        command: 'python -m pytest --json-report',
-      },
-      tests,
-      coverage,
-      rawOutput: stdout + stderr,
-    };
+    // Ultimate fallback: parse verbose stdout
+    return this.parseVerboseOutput(runId, stdout, stderr, exitCode, options);
   }
 
   async listTestFiles(projectDir: string, packageManager?: string): Promise<string[]> {
@@ -198,14 +160,235 @@ export class PytestAdapter extends BaseAdapter {
     const files = new Set<string>();
     for (const line of result.stdout.split('\n')) {
       const match = line.match(/^(.+\.py)::/);
-      if (match) {
-        files.add(relative(projectDir, match[1]));
-      }
+      if (match) files.add(relative(projectDir, match[1]));
     }
     return [...files];
   }
 
-  private parseFallbackOutput(
+  // -------------------------------------------------------------------------
+  // Layer 1: pytest-reportlog JSONL
+  // -------------------------------------------------------------------------
+
+  parseReportLog(
+    runId: string,
+    content: string,
+    stdout: string,
+    stderr: string,
+    options: RunOptions,
+  ): TestRunResult {
+    // Each line is a JSON object. We care about TestReport entries.
+    // Group by nodeid — a test can have setup/call/teardown reports.
+    const byNodeId = new Map<string, {
+      outcome: string;
+      duration: number;
+      longrepr: string[];
+    }>();
+
+    let sessionDuration = 0;
+
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      let entry: ReportLogEntry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      if (entry.$report_type === 'SessionFinish') {
+        sessionDuration = entry.duration ?? 0;
+        continue;
+      }
+
+      if (entry.$report_type !== 'TestReport' || !entry.nodeid) continue;
+
+      const existing = byNodeId.get(entry.nodeid);
+      const longreprStr = typeof entry.longrepr === 'string' ? entry.longrepr : '';
+
+      if (!existing) {
+        byNodeId.set(entry.nodeid, {
+          outcome: entry.outcome ?? 'passed',
+          duration: entry.duration ?? 0,
+          longrepr: longreprStr ? [longreprStr] : [],
+        });
+      } else {
+        // Merge: duration from 'call' phase, worst outcome wins
+        if (entry.when === 'call') {
+          existing.duration = entry.duration ?? existing.duration;
+          existing.outcome = entry.outcome ?? existing.outcome;
+        }
+        // Promote to failed if any phase failed
+        if (entry.outcome === 'failed' || entry.outcome === 'error') {
+          existing.outcome = entry.outcome;
+        }
+        if (longreprStr) {
+          existing.longrepr.push(longreprStr);
+        }
+      }
+    }
+
+    const tests: TestResult[] = [];
+    for (const [nodeid, data] of byNodeId) {
+      const status = mapPytestStatus(data.outcome);
+      const fullError = data.longrepr.join('\n\n').trim() || undefined;
+      const testFile = nodeid.split('::')[0];
+
+      tests.push({
+        name: nodeIdToName(nodeid),
+        fullName: nodeIdToFullName(nodeid),
+        status,
+        duration: Math.round(data.duration * 1000),
+        failureMessage: fullError ? truncate(fullError) : undefined,
+        fullError,
+        sourceContext: status === 'failed'
+          ? { testFile, testLine: this.extractLineNumber(fullError) }
+          : undefined,
+      });
+    }
+
+    const passed = tests.filter(t => t.status === 'passed').length;
+    const failed = tests.filter(t => t.status === 'failed').length;
+    const skipped = tests.filter(t => t.status === 'skipped').length;
+    const failedTests = tests.filter(t => t.status === 'failed').map(t => t.fullName);
+
+    return {
+      summary: {
+        runId,
+        framework: 'pytest',
+        projectDir: options.projectDir,
+        total: tests.length,
+        passed,
+        failed,
+        skipped,
+        duration: Math.round(sessionDuration * 1000),
+        failedTests,
+        timedOut: false,
+        partial: false,
+        timestamp: new Date().toISOString(),
+        command: 'python -m pytest --report-log',
+      },
+      tests,
+      rawOutput: stdout + stderr,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Layer 2: JUnit XML (built-in --junitxml)
+  // -------------------------------------------------------------------------
+
+  parseJunitXml(
+    runId: string,
+    xml: string,
+    stdout: string,
+    stderr: string,
+    options: RunOptions,
+  ): TestRunResult {
+    const tests: TestResult[] = [];
+
+    // Parse <testsuite> attributes for summary
+    const suiteMatch = xml.match(
+      /<testsuite[^>]*\btests="(\d+)"[^>]*\bfailures="(\d+)"[^>]*(?:\berrors="(\d+)")?[^>]*(?:\bskipped="(\d+)")?[^>]*\btime="([\d.]+)"[^>]*>/,
+    );
+
+    // Parse attributes (use \s to avoid matching <testsuites>)
+    const suiteAttrs = this.parseXmlAttributes(xml.match(/<testsuite\s([^>]*)>/)?.[1] ?? '');
+
+    const suiteTotalFromAttr = parseInt(suiteAttrs.tests ?? '0', 10);
+    const suiteFailures = parseInt(suiteAttrs.failures ?? '0', 10);
+    const suiteErrors = parseInt(suiteAttrs.errors ?? '0', 10);
+    const suiteSkipped = parseInt(suiteAttrs.skipped ?? '0', 10);
+    const suiteDuration = parseFloat(suiteAttrs.time ?? '0');
+
+    // Parse <testcase> elements — single pass handles both self-closing and body
+    // [^>]*? is non-greedy so it stops before /> or > without consuming the /
+    const testcaseRe = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase\s*>)/g;
+
+    const processTestcase = (attrStr: string, body: string) => {
+      const attrs = this.parseXmlAttributes(attrStr);
+      const classname = attrs.classname ?? '';
+      const name = attrs.name ?? 'unknown';
+      const time = parseFloat(attrs.time ?? '0');
+
+      const testFile = classname
+        ? classname.replace(/\./g, '/') + '.py'
+        : '';
+
+      let status: TestStatus = 'passed';
+      let failureMessage: string | undefined;
+      let fullError: string | undefined;
+
+      // Parse child element attributes using parseXmlAttributes for reliability
+      const failureTagMatch = body.match(/<failure\b([^>]*)>([\s\S]*?)<\/failure>/);
+      const errorTagMatch = body.match(/<error\b([^>]*)>([\s\S]*?)<\/error>/);
+      const skipTagMatch = body.match(/<skipped\b([^>]*?)(?:\/>|>)/);
+
+      if (failureTagMatch) {
+        status = 'failed';
+        const fAttrs = this.parseXmlAttributes(failureTagMatch[1]);
+        failureMessage = this.unescapeXml(fAttrs.message ?? '');
+        fullError = this.unescapeXml(failureTagMatch[2]?.trim() ?? failureMessage);
+        if (failureMessage) failureMessage = truncate(failureMessage);
+      } else if (errorTagMatch) {
+        status = 'failed';
+        const eAttrs = this.parseXmlAttributes(errorTagMatch[1]);
+        failureMessage = this.unescapeXml(eAttrs.message ?? '');
+        fullError = this.unescapeXml(errorTagMatch[2]?.trim() ?? failureMessage);
+        if (failureMessage) failureMessage = truncate(failureMessage);
+      } else if (skipTagMatch) {
+        status = 'skipped';
+      }
+
+      const nodeid = testFile ? `${testFile}::${name}` : name;
+
+      tests.push({
+        name,
+        fullName: nodeIdToFullName(nodeid),
+        status,
+        duration: Math.round(time * 1000),
+        failureMessage,
+        fullError,
+        sourceContext: status === 'failed'
+          ? { testFile, testLine: this.extractLineNumber(fullError) }
+          : undefined,
+      });
+    };
+
+    let m;
+    while ((m = testcaseRe.exec(xml)) !== null) {
+      processTestcase(m[1], m[2] ?? '');
+    }
+
+    const passed = tests.filter(t => t.status === 'passed').length;
+    const failed = tests.filter(t => t.status === 'failed').length;
+    const skipped = tests.filter(t => t.status === 'skipped').length;
+    const failedTests = tests.filter(t => t.status === 'failed').map(t => t.fullName);
+
+    return {
+      summary: {
+        runId,
+        framework: 'pytest',
+        projectDir: options.projectDir,
+        total: suiteTotalFromAttr || tests.length,
+        passed: suiteTotalFromAttr ? (suiteTotalFromAttr - suiteFailures - suiteErrors - suiteSkipped) : passed,
+        failed: suiteFailures + suiteErrors || failed,
+        skipped: suiteSkipped || skipped,
+        duration: Math.round(suiteDuration * 1000),
+        failedTests,
+        timedOut: false,
+        partial: false,
+        timestamp: new Date().toISOString(),
+        command: 'python -m pytest --junitxml',
+      },
+      tests,
+      rawOutput: stdout + stderr,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Layer 3: Verbose stdout parsing (ultimate fallback)
+  // -------------------------------------------------------------------------
+
+  private parseVerboseOutput(
     runId: string,
     stdout: string,
     stderr: string,
@@ -217,7 +400,6 @@ export class PytestAdapter extends BaseAdapter {
     // --- Step 1: Parse verbose PASSED/FAILED/SKIPPED lines ---
     const linePattern = /^(.+\.py)::(.+?)\s+(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)/;
     const tests: TestResult[] = [];
-    // Map from nodeid (e.g. "tests/unit/test_foo.py::test_broken") to TestResult for later enrichment
     const testsByNodeId = new Map<string, TestResult>();
 
     for (const line of lines) {
@@ -247,7 +429,6 @@ export class PytestAdapter extends BaseAdapter {
       const test = testsByNodeId.get(nodeid);
       if (test) {
         test.fullError = traceback;
-        // Extract line number from traceback (e.g. "tests/unit/test_foo.py:15: AssertionError")
         const lineNoMatch = traceback.match(/^(.+\.py):(\d+):/m);
         if (lineNoMatch && test.sourceContext) {
           test.sourceContext.testLine = parseInt(lineNoMatch[2], 10);
@@ -256,7 +437,6 @@ export class PytestAdapter extends BaseAdapter {
     }
 
     // --- Step 3: Parse short test summary info for failureMessage ---
-    // Lines like: "FAILED tests/unit/test_foo.py::test_broken - AssertionError: assert 20 == 42"
     const summaryInfoPattern = /^FAILED\s+(.+?)\s+-\s+(.+)$/;
     let inSummaryInfo = false;
     for (const line of lines) {
@@ -264,7 +444,6 @@ export class PytestAdapter extends BaseAdapter {
         inSummaryInfo = true;
         continue;
       }
-      // The summary info section ends at the next separator line (all = signs)
       if (inSummaryInfo && /^={3,}/.test(line)) {
         inSummaryInfo = false;
         continue;
@@ -276,14 +455,9 @@ export class PytestAdapter extends BaseAdapter {
       const [, nodeid, message] = match;
       const test = testsByNodeId.get(nodeid);
       if (test) {
-        test.failureMessage = message.length > 500 ? message.slice(0, 500) + '...' : message;
-        // If we didn't get a fullError from the FAILURES section, use the summary line
-        if (!test.fullError) {
-          test.fullError = message;
-        }
+        test.failureMessage = truncate(message);
+        if (!test.fullError) test.fullError = message;
       } else {
-        // Test wasn't found in verbose lines — could happen if verbose line was missed.
-        // Create a minimal TestResult from the summary info.
         const file = nodeid.split('::')[0];
         const nameParts = nodeid.split('::');
         const testName = nameParts[nameParts.length - 1];
@@ -292,7 +466,7 @@ export class PytestAdapter extends BaseAdapter {
           fullName: `${file} > ${nameParts.slice(1).join(' > ')}`,
           status: 'failed',
           duration: 0,
-          failureMessage: message.length > 500 ? message.slice(0, 500) + '...' : message,
+          failureMessage: truncate(message),
           fullError: message,
           sourceContext: { testFile: file, testLine: 0 },
         };
@@ -301,16 +475,14 @@ export class PytestAdapter extends BaseAdapter {
       }
     }
 
-    // For failed tests that have fullError but no failureMessage, derive failureMessage from fullError
+    // Derive failureMessage from fullError if needed
     for (const test of tests) {
       if (test.status === 'failed' && test.fullError && !test.failureMessage) {
-        const msg = test.fullError;
-        test.failureMessage = msg.length > 500 ? msg.slice(0, 500) + '...' : msg;
+        test.failureMessage = truncate(test.fullError);
       }
     }
 
     // --- Step 4: Parse final summary line for accurate counts ---
-    // e.g. "1 failed, 2 passed in 0.5s" or "1 failed, 2 passed, 3 skipped in 1.23s"
     const finalSummary = this.parseFinalSummaryLine(lines);
 
     const passed = finalSummary?.passed ?? tests.filter(t => t.status === 'passed').length;
@@ -334,22 +506,49 @@ export class PytestAdapter extends BaseAdapter {
         timedOut: false,
         partial: tests.length === 0 && exitCode !== 0,
         timestamp: new Date().toISOString(),
-        command: 'python -m pytest (fallback parsing — install pytest-json-report for better results)',
+        command: 'python -m pytest (verbose fallback)',
       },
       tests,
       rawOutput: stdout + stderr,
     };
   }
 
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
+  private extractLineNumber(text?: string): number {
+    if (!text) return 0;
+    const match = text.match(/\.py:(\d+):/m);
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
+  private parseXmlAttributes(attrString: string): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    const pattern = /(\w+)="([^"]*)"/g;
+    let m;
+    while ((m = pattern.exec(attrString)) !== null) {
+      attrs[m[1]] = m[2];
+    }
+    return attrs;
+  }
+
+  private unescapeXml(s: string): string {
+    return s
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  }
+
   /**
    * Parse the "= FAILURES =" section of pytest output.
-   * Each failure block starts with "_ test_name _" and ends at the next such header or a "=" separator.
    * Returns a Map from nodeid to the full traceback string.
    */
   private parseFailureSections(lines: string[]): Map<string, string> {
     const results = new Map<string, string>();
 
-    // Find the start of the FAILURES section
     let failureStart = -1;
     for (let i = 0; i < lines.length; i++) {
       if (/^={3,}\s*FAILURES\s*={3,}$/.test(lines[i].trim())) {
@@ -359,8 +558,6 @@ export class PytestAdapter extends BaseAdapter {
     }
     if (failureStart === -1) return results;
 
-    // Parse individual failure blocks
-    // Each block header: "________ test_name ________" (or "________ TestClass.test_name ________")
     const blockHeaderPattern = /^_{3,}\s+(.+?)\s+_{3,}$/;
     let currentTestName: string | null = null;
     let currentLines: string[] = [];
@@ -368,9 +565,7 @@ export class PytestAdapter extends BaseAdapter {
     for (let i = failureStart; i < lines.length; i++) {
       const line = lines[i];
 
-      // End of FAILURES section — a line of "=" chars that is NOT the FAILURES header itself
       if (/^={3,}/.test(line) && !/FAILURES/.test(line)) {
-        // Save the last block
         if (currentTestName) {
           results.set(currentTestName, currentLines.join('\n').trim());
         }
@@ -379,7 +574,6 @@ export class PytestAdapter extends BaseAdapter {
 
       const headerMatch = line.match(blockHeaderPattern);
       if (headerMatch) {
-        // Save previous block if any
         if (currentTestName) {
           results.set(currentTestName, currentLines.join('\n').trim());
         }
@@ -390,22 +584,15 @@ export class PytestAdapter extends BaseAdapter {
       }
     }
 
-    // Now we need to match block names (e.g. "test_broken") back to nodeids (e.g. "tests/unit/test_foo.py::test_broken").
-    // The traceback itself usually contains the file path and line number, which we can use for matching.
-    // But the simplest approach: the block name is typically the last component(s) of the nodeid.
-    // We'll return using the block name as key and let the caller try to match.
-    // Actually, let's extract the file path from the traceback to build a full nodeid.
+    // Resolve block names to full nodeids using file paths from tracebacks
     const resolved = new Map<string, string>();
     for (const [blockName, traceback] of results) {
-      // Try to find a file reference in the traceback, e.g. "tests/unit/test_foo.py:15: AssertionError"
       const fileMatch = traceback.match(/^(.+\.py):\d+:/m);
       if (fileMatch) {
-        // Reconstruct nodeid: file::blockName (blockName may be "TestClass.test_method" → "TestClass::test_method")
         const file = fileMatch[1].trim();
         const nodeid = `${file}::${blockName.replace(/\./g, '::')}`;
         resolved.set(nodeid, traceback);
       } else {
-        // Can't resolve file; use blockName as-is (caller won't match, but we tried)
         resolved.set(blockName, traceback);
       }
     }
@@ -413,21 +600,13 @@ export class PytestAdapter extends BaseAdapter {
     return resolved;
   }
 
-  /**
-   * Parse the final summary line, e.g. "1 failed, 2 passed in 0.5s" or "3 passed in 0.12s".
-   * Returns extracted counts and duration, or null if not found.
-   */
   private parseFinalSummaryLine(lines: string[]): {
     passed: number; failed: number; skipped: number; duration: number;
   } | null {
-    // The final summary line is typically the last non-empty line or preceded by "="
-    // Pattern: "={N} <counts> in <duration> ={N}" or just "<counts> in <duration>"
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i];
-      // Look for lines containing " passed" or " failed" followed by "in <N>s"
       if (!/\b(?:passed|failed)\b/.test(line) || !/\bin\s+[\d.]+s\b/.test(line)) continue;
 
-      // Extract individual counts: "N passed", "N failed", "N skipped"
       const passedMatch = line.match(/(\d+)\s+passed/);
       const failedMatch = line.match(/(\d+)\s+failed/);
       const skippedMatch = line.match(/(\d+)\s+skipped/);
@@ -435,12 +614,12 @@ export class PytestAdapter extends BaseAdapter {
 
       if (!durationMatch) continue;
 
-      const passed = passedMatch ? parseInt(passedMatch[1], 10) : 0;
-      const failed = failedMatch ? parseInt(failedMatch[1], 10) : 0;
-      const skipped = skippedMatch ? parseInt(skippedMatch[1], 10) : 0;
-      const duration = Math.round(parseFloat(durationMatch[1]) * 1000);
-
-      return { passed, failed, skipped, duration };
+      return {
+        passed: passedMatch ? parseInt(passedMatch[1], 10) : 0,
+        failed: failedMatch ? parseInt(failedMatch[1], 10) : 0,
+        skipped: skippedMatch ? parseInt(skippedMatch[1], 10) : 0,
+        duration: Math.round(parseFloat(durationMatch[1]) * 1000),
+      };
     }
 
     return null;

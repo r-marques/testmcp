@@ -10,6 +10,7 @@ import { runProcess } from './utils/process.js';
 import { enrichTestResults } from './enrichment/source-context.js';
 import { getAffectedTests } from './git/diff-analyzer.js';
 import type { FrameworkName, RunOptions, TestRunResult } from './types.js';
+import type { PytestParseMode } from './adapters/pytest.js';
 
 const store = new RunStore();
 const adapters: BaseAdapter[] = [new JestAdapter(), new VitestAdapter(), new PytestAdapter()];
@@ -31,6 +32,22 @@ function errorResponse(code: string, message: string, hint?: string) {
   };
 }
 
+/** Pytest fallback chain: reportlog → junitxml → verbose */
+const PYTEST_FALLBACK_CHAIN: PytestParseMode[] = ['reportlog', 'junitxml', 'verbose'];
+
+function isPytestUnrecognizedFlag(stderr: string, mode: PytestParseMode): boolean {
+  if (mode === 'reportlog') {
+    return stderr.includes('unrecognized arguments: --report-log')
+      || stderr.includes('unrecognized arguments: --report_log');
+  }
+  // junitxml is built-in to pytest, so it should never be unrecognized.
+  // But handle edge cases defensively.
+  if (mode === 'junitxml') {
+    return stderr.includes('unrecognized arguments: --junitxml');
+  }
+  return false;
+}
+
 async function executeRun(adapter: BaseAdapter, options: RunOptions): Promise<TestRunResult> {
   let buildOptions = options;
   let { command, args, env } = adapter.buildCommand(buildOptions);
@@ -48,26 +65,28 @@ async function executeRun(adapter: BaseAdapter, options: RunOptions): Promise<Te
     timeout: options.timeout,
   });
 
-  // Pytest retry: if --json-report is unrecognized, retry in fallback (verbose) mode
-  if (
-    adapter.framework === 'pytest'
-    && processResult.exitCode !== 0
-    && processResult.stderr.includes('unrecognized arguments: --json-report')
-  ) {
-    buildOptions = { ...options, fallbackMode: true } as RunOptions & { fallbackMode?: boolean };
-    const retry = adapter.buildCommand(buildOptions);
-    command = retry.command;
-    args = retry.args;
-    env = retry.env;
-    mergedOptions = { ...buildOptions, env: { ...buildOptions.env, ...env } };
+  // Pytest fallback chain: if current mode's flag is unrecognized, try next mode
+  if (adapter.framework === 'pytest' && processResult.exitCode !== 0) {
+    for (let i = 1; i < PYTEST_FALLBACK_CHAIN.length; i++) {
+      const currentMode = PYTEST_FALLBACK_CHAIN[i - 1];
+      const nextMode = PYTEST_FALLBACK_CHAIN[i];
+      if (!isPytestUnrecognizedFlag(processResult.stderr, currentMode)) break;
 
-    processResult = await runProcess({
-      command,
-      args,
-      cwd: options.projectDir,
-      env: mergedOptions.env,
-      timeout: options.timeout,
-    });
+      buildOptions = { ...options, parseMode: nextMode } as RunOptions & { parseMode: PytestParseMode };
+      const retry = adapter.buildCommand(buildOptions);
+      command = retry.command;
+      args = retry.args;
+      env = retry.env;
+      mergedOptions = { ...buildOptions, env: { ...buildOptions.env, ...env } };
+
+      processResult = await runProcess({
+        command,
+        args,
+        cwd: options.projectDir,
+        env: mergedOptions.env,
+        timeout: options.timeout,
+      });
+    }
   }
 
   const result = await adapter.parseOutput(

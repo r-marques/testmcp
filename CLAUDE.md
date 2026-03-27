@@ -60,7 +60,7 @@ Jest, Vitest, and Pytest JSON output schemas vary by version. Always verify agai
 
 - **Jest**: Uses `testResults[].name` (NOT `testFilePath`) for file path, `assertionResults` (NOT `testResults`) for individual tests
 - **Vitest**: Uses nested `tasks` with `type: 'test' | 'suite'` structure
-- **Pytest**: Requires `pytest-json-report` plugin; fallback mode parses `PASSED/FAILED` stdout lines
+- **Pytest**: Layered fallback — `pytest-reportlog` JSONL (primary) → `--junitxml` built-in XML (fallback 1) → verbose stdout parsing (fallback 2)
 
 When modifying adapters, always test against a real project's actual JSON output before assuming field names.
 
