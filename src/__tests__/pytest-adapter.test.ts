@@ -255,6 +255,35 @@ tests/test_math.py:15: AssertionError
 
       expect(result.tests[0].fullName).toBe('tests/unit/test_utils.py > test_parse');
     });
+
+    it('parses multiple testsuites (Vitest JUnit format)', () => {
+      const xml = `<?xml version="1.0" encoding="UTF-8" ?>
+<testsuites name="vitest tests" tests="5" failures="1" errors="0" time="0.500">
+  <testsuite name="src/utils.test.ts" tests="3" failures="0" time="0.1">
+    <testcase classname="src/utils.test.ts" name="adds numbers" time="0.01"/>
+    <testcase classname="src/utils.test.ts" name="subtracts numbers" time="0.01"/>
+    <testcase classname="src/utils.test.ts" name="multiplies numbers" time="0.01"/>
+  </testsuite>
+  <testsuite name="src/api.test.ts" tests="2" failures="1" time="0.2">
+    <testcase classname="src/api.test.ts" name="handles GET" time="0.01"/>
+    <testcase classname="src/api.test.ts" name="handles POST" time="0.05">
+      <failure message="expected 200 to be 201">stack trace here</failure>
+    </testcase>
+  </testsuite>
+</testsuites>`;
+
+      const result = adapter.parseJunitXml('run-6', xml, '', '', baseOptions);
+
+      expect(result.tests).toHaveLength(5);
+      expect(result.summary.total).toBe(5);
+      expect(result.summary.passed).toBe(4);
+      expect(result.summary.failed).toBe(1);
+      expect(result.summary.duration).toBe(500);
+
+      const failed = result.tests.find(t => t.status === 'failed');
+      expect(failed).toBeDefined();
+      expect(failed!.name).toBe('handles POST');
+    });
   });
 
   // -------------------------------------------------------------------------

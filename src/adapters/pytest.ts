@@ -285,19 +285,18 @@ export class PytestAdapter extends BaseAdapter {
   ): TestRunResult {
     const tests: TestResult[] = [];
 
-    // Parse <testsuite> attributes for summary
-    const suiteMatch = xml.match(
-      /<testsuite[^>]*\btests="(\d+)"[^>]*\bfailures="(\d+)"[^>]*(?:\berrors="(\d+)")?[^>]*(?:\bskipped="(\d+)")?[^>]*\btime="([\d.]+)"[^>]*>/,
-    );
-
-    // Parse attributes (use \s to avoid matching <testsuites>)
+    // Parse summary attributes — prefer <testsuites> root (aggregated), fall back to first <testsuite>
+    const suitesAttrs = this.parseXmlAttributes(xml.match(/<testsuites\s([^>]*)>/)?.[1] ?? '');
     const suiteAttrs = this.parseXmlAttributes(xml.match(/<testsuite\s([^>]*)>/)?.[1] ?? '');
+    // Use <testsuites> if it has a tests count, otherwise fall back to <testsuite>
+    const summaryAttrs = suitesAttrs.tests ? suitesAttrs : suiteAttrs;
 
-    const suiteTotalFromAttr = parseInt(suiteAttrs.tests ?? '0', 10);
-    const suiteFailures = parseInt(suiteAttrs.failures ?? '0', 10);
-    const suiteErrors = parseInt(suiteAttrs.errors ?? '0', 10);
-    const suiteSkipped = parseInt(suiteAttrs.skipped ?? '0', 10);
-    const suiteDuration = parseFloat(suiteAttrs.time ?? '0');
+    const attrTotal = parseInt(summaryAttrs.tests ?? '0', 10);
+    const attrFailures = parseInt(summaryAttrs.failures ?? '0', 10);
+    const attrErrors = parseInt(summaryAttrs.errors ?? '0', 10);
+    const attrSkipped = parseInt(summaryAttrs.skipped ?? '0', 10);
+    // Duration: prefer <testsuites> time, but Vitest only sets it there
+    const suiteDuration = parseFloat(suitesAttrs.time ?? suiteAttrs.time ?? '0');
 
     // Parse <testcase> elements — single pass handles both self-closing and body
     // [^>]*? is non-greedy so it stops before /> or > without consuming the /
@@ -363,15 +362,19 @@ export class PytestAdapter extends BaseAdapter {
     const skipped = tests.filter(t => t.status === 'skipped').length;
     const failedTests = tests.filter(t => t.status === 'failed').map(t => t.fullName);
 
+    // Prefer actual parsed test counts — they're always accurate.
+    // Fall back to XML attributes only when no testcases were parsed.
+    const useAttr = tests.length === 0 && attrTotal > 0;
+
     return {
       summary: {
         runId,
         framework: 'pytest',
         projectDir: options.projectDir,
-        total: suiteTotalFromAttr || tests.length,
-        passed: suiteTotalFromAttr ? (suiteTotalFromAttr - suiteFailures - suiteErrors - suiteSkipped) : passed,
-        failed: suiteFailures + suiteErrors || failed,
-        skipped: suiteSkipped || skipped,
+        total: useAttr ? attrTotal : tests.length,
+        passed: useAttr ? (attrTotal - attrFailures - attrErrors - attrSkipped) : passed,
+        failed: useAttr ? (attrFailures + attrErrors) : failed,
+        skipped: useAttr ? attrSkipped : skipped,
         duration: Math.round(suiteDuration * 1000),
         failedTests,
         timedOut: false,
