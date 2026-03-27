@@ -11,6 +11,8 @@ import { enrichTestResults } from './enrichment/source-context.js';
 import { getAffectedTests } from './git/diff-analyzer.js';
 import type { FrameworkName, RunOptions, TestRunResult } from './types.js';
 import type { PytestParseMode } from './adapters/pytest.js';
+import { parseLog } from './ci/log-parser.js';
+import { listArtifacts, parseArtifact } from './ci/artifacts.js';
 
 const store = new RunStore();
 const adapters: BaseAdapter[] = [new JestAdapter(), new VitestAdapter(), new PytestAdapter()];
@@ -349,6 +351,63 @@ export function registerTools(server: McpServer): void {
         return jsonResponse({ message: 'No test runs recorded yet', runs: [] });
       }
       return jsonResponse({ runs });
+    },
+  );
+
+  // --- parse_log ---
+  server.tool(
+    'parse_log',
+    'Parse raw CI/test log text and extract structured test results. Auto-detects framework (Jest, Vitest, Pytest) from the log content.',
+    {
+      text: z.string().describe('Raw CI log or test output text to parse'),
+      framework: z.enum(['jest', 'vitest', 'pytest']).optional().describe('Force a specific framework instead of auto-detecting'),
+    },
+    async ({ text, framework }) => {
+      try {
+        const result = await parseLog(text, { framework });
+        store.save(result);
+        return jsonResponse(result.summary);
+      } catch (err) {
+        return errorResponse('parse_failed', `Failed to parse log: ${err}`);
+      }
+    },
+  );
+
+  // --- list_artifacts ---
+  server.tool(
+    'list_artifacts',
+    'List artifacts from a GitHub Actions run. Use with parse_artifact to download and parse test result artifacts.',
+    {
+      repo: z.string().describe('GitHub repo in owner/repo format (e.g. "r-marques/testmcp")'),
+      runId: z.string().describe('GitHub Actions run ID'),
+    },
+    async ({ repo, runId }) => {
+      try {
+        const result = await listArtifacts(repo, runId);
+        return jsonResponse(result);
+      } catch (err) {
+        return errorResponse('artifacts_failed', `Failed to list artifacts: ${err}`);
+      }
+    },
+  );
+
+  // --- parse_artifact ---
+  server.tool(
+    'parse_artifact',
+    'Download a GitHub Actions artifact and parse it as test results. Supports JUnit XML, Jest JSON, Vitest JSON, and pytest-reportlog JSONL.',
+    {
+      repo: z.string().describe('GitHub repo in owner/repo format (e.g. "r-marques/testmcp")'),
+      runId: z.string().describe('GitHub Actions run ID'),
+      artifactName: z.string().describe('Name of the artifact to download and parse'),
+    },
+    async ({ repo, runId, artifactName }) => {
+      try {
+        const result = await parseArtifact(repo, runId, artifactName);
+        store.save(result);
+        return jsonResponse(result.summary);
+      } catch (err) {
+        return errorResponse('artifact_parse_failed', `Failed to parse artifact: ${err}`);
+      }
     },
   );
 }

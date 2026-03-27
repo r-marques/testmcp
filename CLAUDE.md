@@ -23,8 +23,11 @@ src/
 ├── adapters/
 │   ├── base.ts             # Abstract adapter interface
 │   ├── jest.ts             # Jest adapter (--json, assertionResults, name field)
-│   ├── vitest.ts           # Vitest adapter (run --reporter=json, nested tasks)
-│   └── pytest.ts           # Pytest adapter (--json-report, fallback stdout parsing)
+│   ├── vitest.ts           # Vitest adapter (v1.x tasks + v2+ assertionResults)
+│   └── pytest.ts           # Pytest adapter (reportlog → junitxml → verbose)
+├── ci/
+│   ├── log-parser.ts       # Framework detection + raw CI log parsing
+│   └── artifacts.ts        # GitHub Actions artifact listing + download + parsing
 ├── git/
 │   └── diff-analyzer.ts    # Git diff → affected test files (3 layers)
 ├── enrichment/
@@ -46,6 +49,9 @@ src/
 | `rerun_failed` | Re-execute only previously failed tests |
 | `get_coverage` | Coverage data from a previous run |
 | `list_runs` | List recent test run summaries |
+| `parse_log` | Parse raw CI/test log text, auto-detect framework |
+| `list_artifacts` | List GitHub Actions artifacts for a run |
+| `parse_artifact` | Download + parse a GitHub Actions test artifact |
 
 ## Key Design Decisions
 

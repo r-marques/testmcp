@@ -58,6 +58,8 @@ claude mcp list
 
 ## Tools
 
+### Test Execution
+
 | Tool | Purpose |
 |------|---------|
 | `discover` | Auto-detect test frameworks in a project |
@@ -68,6 +70,16 @@ claude mcp list
 | `rerun_failed` | Re-execute only previously failed tests |
 | `get_coverage` | Coverage data from a previous run |
 | `list_runs` | List recent test run summaries |
+
+### CI Log Parsing
+
+| Tool | Purpose |
+|------|---------|
+| `parse_log` | Parse raw CI/test log text and extract structured test results. Auto-detects framework. |
+| `list_artifacts` | List artifacts from a GitHub Actions run |
+| `parse_artifact` | Download a GitHub Actions artifact and parse it as test results |
+
+The CI tools enable a workflow where the LLM reads a CI workflow file to identify the right artifact, then uses `parse_artifact` to get structured results — no manual log parsing needed.
 
 ## How It Works
 
@@ -144,7 +156,7 @@ The server automatically falls through the chain if a plugin isn't installed —
 ```
 src/
 ├── index.ts              # Entry: McpServer + StdioServerTransport
-├── server.ts             # 8 MCP tool registrations & handlers
+├── server.ts             # 11 MCP tool registrations & handlers
 ├── types.ts              # Core types
 ├── store.ts              # In-memory test run storage (LRU, 50 runs)
 ├── adapters/
@@ -152,6 +164,9 @@ src/
 │   ├── jest.ts           # Jest adapter
 │   ├── vitest.ts         # Vitest adapter (v1.x + v2+ formats)
 │   └── pytest.ts         # Pytest adapter (reportlog → junitxml → verbose)
+├── ci/
+│   ├── log-parser.ts     # Framework detection + raw CI log parsing
+│   └── artifacts.ts      # GitHub Actions artifact listing + download + parsing
 ├── git/
 │   └── diff-analyzer.ts  # Git diff → affected test files
 ├── enrichment/
